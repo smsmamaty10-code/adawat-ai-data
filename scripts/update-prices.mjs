@@ -27,11 +27,24 @@ function monthly(t) { const out = new Map(); for (const m of t.matchAll(RE)) { c
   out.set(v, (out.get(v) || false) || annual) } return [...out].map(([v, annual]) => ({ v, annual })) }
 const same = (a, b) => Math.abs(a - b) < 0.006;
 
-const stats = { total: data.tools.length, confirmed: 0, changed: 0, unchanged: 0, unreadable: 0, skipped: 0 }; const ex = { confirmed: [], changed: [], unchanged: [], unreadable: [] };
+
+// ---- conservative offer detection: «N% off» / «discount N%» / «save N%» within 80 chars of a $ price,
+// plus promo wording (first month / new user / limited time / offer / sale / promo / coupon…), NOT annual-billing/API/lifetime wording (that's a standard discount). Auto offers are refreshed each run; kept ≤14 days if page unreadable.
+const OFF_RE = /(\d{1,2})\s?%\s?off\b|\b(?:discount|save)\s(?:of\s)?(\d{1,2})\s?%/gi;
+function offers(t) { const out = []; for (const m of t.matchAll(OFF_RE)) { const pc = +(m[1] || m[2]); if (pc < 5 || pc > 90) continue;
+  const ctx = t.slice(Math.max(0, m.index - 80), m.index + m[0].length + 80); if (!/\$\s?\d/.test(ctx) || /annual|yearly|\/\s*year|per year|billed|year|lifetime|batch|mtok|api\b|per credit|proofread/i.test(ctx)) continue;
+  if (!/first month|new user|limited[- ]time|offer|sale\b|promo|black friday|cyber monday|launch|ends|today only|coupon/i.test(ctx)) continue; // must look like a real promotion
+  out.push({ pc, quote: ctx.trim().slice(0, 200) }) } return out }
+const daysAgo = d => (Date.parse(TODAY) - Date.parse(d)) / 864e5;
+function setAutoOffers(t, found, url) { const keep = (t.offers || []).filter(o => !o.auto); const prevAuto = (t.offers || []).filter(o => o.auto);
+  let auto; if (found === null) auto = prevAuto.filter(o => daysAgo(o.captured_on) <= 14);
+  else { const pcs = [...new Set(found.map(f => f.pc))]; auto = pcs.length === 1 ? [{ auto: true, text_ar: `خصم ${pcs[0]}%${/first month/i.test(found[0].quote) ? ' على الشهر الأول' : ''}${/new user/i.test(found[0].quote) ? ' للمستخدمين الجدد' : ''} مرصود في صفحة الأسعار الرسمية`, quote_en: found[0].quote, source: url, captured_on: TODAY, ends_on: null }] : [] }
+  const all = [...keep, ...auto]; if (all.length) t.offers = all; else delete t.offers; if (auto.length) stats.offers++ }
+const stats = { total: data.tools.length, confirmed: 0, changed: 0, unchanged: 0, unreadable: 0, skipped: 0, offers: 0 }; const ex = { confirmed: [], changed: [], unchanged: [], unreadable: [] };
 const tasks = data.tools.map(t => async () => {
   const p = num(t.price_usd); const url = [t.price_url, t.source].find(u => typeof u === 'string' && /^https?:\/\//.test(u));
   if (!p || p <= 0 || t.price_type !== 'ثابت' || !url) { stats.skipped++; return }
-  const html = await get(url); if (!html) { stats.unreadable++; ex.unreadable.push(t.id); return }
+  const html = await get(url); setAutoOffers(t, html ? offers(text(html)) : null, url); if (!html) { stats.unreadable++; ex.unreadable.push(t.id); return }
   const cc = monthly(text(html)); const c = cc.map(x => x.v);
   if (!c.length) { stats.unreadable++; ex.unreadable.push(t.id); return }
   if (c.some(v => same(v, p))) { t.price_captured_on = TODAY; t.updated = TODAY; stats.confirmed++; ex.confirmed.push(`${t.id} $${p}`); return }
@@ -59,7 +72,7 @@ if (data.preview === true || data.tools.some(t => 'review_pending' in t)) fail('
 
 const changed = JSON.stringify(data.tools) !== JSON.stringify(old.tools);
 if (changed) { data.built = TODAY; fs.writeFileSync(FILE, JSON.stringify(data)) }
-const summary = `prices: ${stats.confirmed} confirmed, ${stats.changed} updated, ${stats.unchanged} unchanged (ambiguous), ${stats.unreadable} unreadable, ${stats.skipped} skipped (free/usage/no price) of ${stats.total}`;
+const summary = `offers detected: ${stats.offers}; prices: ${stats.confirmed} confirmed, ${stats.changed} updated, ${stats.unchanged} unchanged (ambiguous), ${stats.unreadable} unreadable, ${stats.skipped} skipped (free/usage/no price) of ${stats.total}`;
 console.log(summary); for (const k of Object.keys(ex)) console.log(k + ':', ex[k].join(' | ') || '-');
 if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\nsummary=${summary}\n`);
 if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + '\n\n' + Object.entries(ex).map(([k, v]) => `**${k}**: ${v.join(', ') || '-'}`).join('\n\n') + '\n');
