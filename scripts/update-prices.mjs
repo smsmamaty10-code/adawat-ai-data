@@ -36,9 +36,10 @@ function offers(t) { const out = []; for (const m of t.matchAll(OFF_RE)) { const
   if (!/first month|new user|limited[- ]time|offer|sale\b|promo|black friday|cyber monday|launch|ends|today only|coupon/i.test(ctx)) continue; // must look like a real promotion
   out.push({ pc, quote: ctx.trim().slice(0, 200) }) } return out }
 const daysAgo = d => (Date.parse(TODAY) - Date.parse(d)) / 864e5;
-function setAutoOffers(t, found, url) { const keep = (t.offers || []).filter(o => !o.auto); const prevAuto = (t.offers || []).filter(o => o.auto);
+function setAutoOffers(t, found, url) { const keep = (t.offers || []).filter(o => !o.auto && !(o.ends_on && o.ends_on < TODAY)); // manual offers are never removed except when their end date has passed
+  const manualPromo = keep.some(o => o.type === 'limited' || o.type === 'new_user'); if (manualPromo) found = found === null ? null : []; const prevAuto = (t.offers || []).filter(o => o.auto);
   let auto; if (found === null) auto = prevAuto.filter(o => daysAgo(o.captured_on) <= 14);
-  else { const pcs = [...new Set(found.map(f => f.pc))]; auto = pcs.length === 1 ? [{ auto: true, text_ar: `خصم ${pcs[0]}%${/first month/i.test(found[0].quote) ? ' على الشهر الأول' : ''}${/new user/i.test(found[0].quote) ? ' للمستخدمين الجدد' : ''} مرصود في صفحة الأسعار الرسمية`, quote_en: found[0].quote, source: url, captured_on: TODAY, ends_on: null }] : [] }
+  else { const pcs = [...new Set(found.map(f => f.pc))]; auto = pcs.length === 1 ? [{ auto: true, type: 'limited', text_ar: `خصم ${pcs[0]}%${/first month/i.test(found[0].quote) ? ' على الشهر الأول' : ''}${/new user/i.test(found[0].quote) ? ' للمستخدمين الجدد' : ''} مرصود في صفحة الأسعار الرسمية`, quote_en: found[0].quote, source: url, captured_on: TODAY, ends_on: null }] : [] }
   const all = [...keep, ...auto]; if (all.length) t.offers = all; else delete t.offers; if (auto.length) stats.offers++ }
 const stats = { total: data.tools.length, confirmed: 0, changed: 0, unchanged: 0, unreadable: 0, skipped: 0, offers: 0 }; const ex = { confirmed: [], changed: [], unchanged: [], unreadable: [] };
 const tasks = data.tools.map(t => async () => {
