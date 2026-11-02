@@ -27,9 +27,12 @@ const UA = 'Mozilla/5.0 (compatible; adawat-ai-price-check/2.0; +https://github.
 const num = v => typeof v === 'number' && isFinite(v) ? v : null;
 const log = (...x) => console.error(...x);
 
-async function staticFetch(url) {
+// Reference price = the US price in USD. Every request asks for the US/English page; per-tool overrides in config.fetch_profile.
+const DEFAULT_PROFILE = { locale: 'en-US', timezone: 'America/New_York', accept_language: 'en-US,en;q=0.9' };
+const profileOf = id => ({ ...DEFAULT_PROFILE, ...(CFG.fetch_profile?.[id] || {}) });
+async function staticFetch(url, prof = DEFAULT_PROFILE) {
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
-  try { const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': UA, 'accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8', 'accept-language': 'en-US,en;q=0.8' } });
+  try { const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': UA, 'accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8', 'accept-language': prof.accept_language } });
     const html = await r.text(); return { status: r.status, html, challenge: isChallenge(r.status, html), ok: r.ok && html.length > 500 } }
   catch (e) { return { status: 0, html: '', error: String(e && e.name || e), ok: false } } finally { clearTimeout(tm) }
 }
@@ -37,10 +40,10 @@ async function staticFetch(url) {
 let browserP = null;
 async function browser() { if (!RENDER) return null; if (!browserP) browserP = (async () => { try { const pw = await import(process.env.PW_MODULE || 'playwright'); return await pw.chromium.launch({ headless: true }) } catch (e) { log('playwright unavailable:', e.message); return null } })(); return browserP }
 let renderSlots = 3; const waiters = [];
-async function render(url, clicks = []) {
+async function render(url, clicks = [], prof = DEFAULT_PROFILE) {
   const b = await browser(); if (!b) return null;
   if (renderSlots <= 0) await new Promise(r => waiters.push(r)); renderSlots--;
-  const ctx = await b.newContext({ locale: 'en-US', viewport: { width: 1366, height: 900 } }); const page = await ctx.newPage();
+  const ctx = await b.newContext({ locale: prof.locale, timezoneId: prof.timezone, extraHTTPHeaders: { 'accept-language': prof.accept_language }, viewport: { width: 1366, height: 900 } }); const page = await ctx.newPage();
   try { const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(1500);
@@ -70,17 +73,19 @@ const host = u => { try { return new URL(u).hostname.replace(/^www\./, '').split
 const isConverted = t => !!(t.price_orig || t.price_orig_currency || /محوَّل|محول|بسعر صرف/.test(String(t.price_note || '')));
 const noteHas = (t, v) => new RegExp(`(^|[^\\d.])${String(v).replace('.', '\\.')}(?![\\d])`).test(String(t.price_note || ''));
 
+// what the runner actually saw on each live page (for the US-vs-stored price diff report)
+const seenOf = pages => pages.map(x => ({ url: x.url, via: x.via, monthly: x.ev.monthly.slice(0, 10), yearly: x.ev.yearly.slice(0, 6), dollars: (x.ev.dollars || []).slice(0, 15), snips: (x.ev.snips || []).slice(0, 4), non_usd: x.ev.nonUsd || [] }));
 async function checkTool(t) {
   const p = num(t.price_usd); const primary = CFG.price_url?.[t.id] || [t.price_url, t.source].find(u => typeof u === 'string' && /^https?:\/\//.test(u));
   const r = { id: t.id, name: t.name, price: p, url: primary || null };
   if (!p || p <= 0 || t.price_type !== 'ثابت' || !primary) return { ...r, status: 'skipped', cause: t.price_type === 'مجاني بالكامل' || p === 0 ? 'free' : t.price_type === 'حسب الاستخدام' ? 'usage-based' : 'no-price' };
   if (isConverted(t)) return { ...r, status: 'manual', cause: 'converted-currency' };
   const urls = [...new Set([primary, ...(CFG.extra_sources?.[t.id] || []), ...(typeof t.price_yearly_source === 'string' && host(t.price_yearly_source) === host(primary) ? [t.price_yearly_source] : [])])];
-  const pages = []; const fetchInfo = [];
-  for (const url of urls) { const f = await staticFetch(url); fetchInfo.push({ url, via: 'static', status: f.status, challenge: !!f.challenge, error: f.error });
+  const pages = []; const fetchInfo = []; const prof = profileOf(t.id);
+  for (const url of urls) { const f = await staticFetch(url, prof); fetchInfo.push({ url, via: 'static', status: f.status, challenge: !!f.challenge, error: f.error });
     if (f.ok && !f.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), f.html, htmlToText(f.html)); pages.push({ url, via: 'static', ev }); if (ev.confirm) break } }
   let conf = pages.find(x => x.ev.confirm);
-  if (!conf && RENDER) for (const url of urls) { const g = await render(url, CFG.render_clicks?.[t.id] || []); if (!g) break; fetchInfo.push({ url, via: 'rendered', status: g.status, challenge: !!g.challenge, error: g.error });
+  if (!conf && RENDER) for (const url of urls) { const g = await render(url, CFG.render_clicks?.[t.id] || [], prof); if (!g) break; fetchInfo.push({ url, via: 'rendered', status: g.status, challenge: !!g.challenge, error: g.error });
     if (g.text && g.text.length > 200 && !g.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), g.html, g.text); pages.push({ url, via: 'rendered', ev }); if (ev.confirm) { conf = pages.at(-1); break } } }
   if (conf) return { ...r, status: 'confirmed', method: conf.ev.confirm.method, computed: !!conf.ev.confirm.computed, via: conf.via, source: conf.url, quote: conf.ev.confirm.ctx.slice(0, 220) };
   // ---- change proposal: every readable page must offer exactly ONE strict monthly value, the same one, not mentioned in the note as another plan
@@ -93,7 +98,7 @@ async function checkTool(t) {
   }
   // ---- Wayback: confirm-only
   if (WAYBACK) { const w = await wayback(primary); if (w && w.html) { const ev = evaluate(p, num(t.price_yearly_usd), w.html, htmlToText(w.html));
-      if (ev.confirm) return { ...r, status: 'confirmed', method: 'wayback+' + ev.confirm.method, computed: !!ev.confirm.computed, via: 'wayback', source: w.snapshot, snapshot_date: w.date, quote: ev.confirm.ctx.slice(0, 220) } }
+      if (ev.confirm) return { ...r, status: 'confirmed', live_seen: seenOf(pages), method: 'wayback+' + ev.confirm.method, computed: !!ev.confirm.computed, via: 'wayback', source: w.snapshot, snapshot_date: w.date, quote: ev.confirm.ctx.slice(0, 220) } }
     r.wayback = w ? (w.tooOld ? `snapshot too old (${w.date})` : `snapshot ${w.date}: price not found`) : 'no snapshot' }
   // ---- classify failure
   const anyBlocked = fetchInfo.some(f => f.challenge || [401, 403, 429, 503].includes(f.status)), anyRead = pages.length > 0;
@@ -104,7 +109,7 @@ async function checkTool(t) {
   else if (yearly.length) cause = 'annual-only (no matching annual÷12)';
   else if (pages.every(x => x.ev.dollarCount === 0)) cause = RENDER ? 'no-$-price-even-rendered (JS/geo/blocked)' : 'js-rendered (no $ in static HTML)';
   else cause = 'no-monthly-price-format';
-  return { ...r, status: 'unconfirmed', cause, monthly: monthly.slice(0, 8), yearly: yearly.slice(0, 5), fetch: fetchInfo };
+  return { ...r, status: 'unconfirmed', cause, monthly: monthly.slice(0, 8), yearly: yearly.slice(0, 5), fetch: fetchInfo, seen: seenOf(pages) };
 }
 
 // ---- run (small concurrency)

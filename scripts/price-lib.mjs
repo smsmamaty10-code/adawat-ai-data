@@ -108,6 +108,10 @@ export const monthlyFromYear = y => Math.round((y / 12) * 100) / 100;
 const CHALLENGE = /Just a moment\.\.\.|cf-browser-verification|challenge-platform\/|Attention Required! \| Cloudflare|_Incapsula_Resource|px-captcha|Access to this page has been denied|DataDome/i;
 export const isChallenge = (status, html) => status === 403 || status === 429 || status === 503 || CHALLENGE.test(String(html || '').slice(0, 20000));
 
+// local-currency / geo-pricing hints on a page (e.g. the page was served for Egypt instead of the US)
+export function nonUsdMarks(text) { const t = String(text || ''); const out = [];
+  for (const [k, re] of [['EGP', /E£|EGP|ج\.م/], ['EUR', /€\s?\d|\d\s?€/], ['GBP', /(?<!E)£\s?\d/], ['INR', /₹\s?\d/], ['TRY', /₺\s?\d/], ['SAR', /SAR\s?\d|ر\.س/], ['AED', /AED\s?\d/]]) if (re.test(t)) out.push(k);
+  return out }
 // Evaluate one page for a tool with stored monthly price p.
 // returns {confirm: null|{method, value, ctx}, strict:[values usable for change proposals], all:[...], yearly:[...]}
 export function evaluate(p, yearlyStored, html, text) {
@@ -127,5 +131,5 @@ export function evaluate(p, yearlyStored, html, text) {
   }
   // strict candidates for change proposals: explicit monthly text, not annual-billed, not first-month promo; plus JSON-LD monthly
   const strict = [...new Set([...month.filter(c => !c.annual && !c.firstMonth).map(c => c.v), ...emb.filter(e => e.kind === 'jsonld' && e.period === 'month').map(e => e.v)])];
-  return { confirm, strict, monthly: [...new Set(month.map(c => c.v))], yearly: [...new Set(year.map(c => c.v))], embeddedCount: emb.length, textLen: text.length, dollarCount: (normalizeMoney(text).match(/\$\d/g) || []).length };
+  return { confirm, strict, monthly: [...new Set(month.map(c => c.v))], yearly: [...new Set(year.map(c => c.v))], embeddedCount: emb.length, textLen: text.length, dollars: [...new Set(cs.map(c => c.v))], snips: cs.slice(0, 4).map(c => String(c.ctx || '').slice(0, 120)), nonUsd: nonUsdMarks(text), dollarCount: (normalizeMoney(text).match(/\$\d/g) || []).length };
 }

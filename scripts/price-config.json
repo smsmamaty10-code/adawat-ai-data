@@ -1,7 +1,8 @@
 {
   "_doc": "Overrides for scripts/update-prices.mjs. price_url: page to check instead of tool.price_url/source. extra_sources: additional OFFICIAL vendor URLs (count as independent sources). data_fixes: one-time data corrections applied only when publishing (DRY_RUN=false), and only if the current value equals 'from'. converted: tools whose stored USD is converted from a local currency (manual check only). render_clicks: exact visible labels Playwright clicks before reading the rendered page (tabs only, never sign-in or consent bypass).",
   "price_url": {
-    "kling": "https://kling.ai/app/membership/membership-plan"
+    "kling": "https://kling.ai/app/membership/membership-plan",
+    "veed": "https://www.veed.io/pricing"
   },
   "extra_sources": {},
   "data_fixes": {
@@ -19,5 +20,13 @@
     "soundraw": [
       "Content creators"
     ]
+  },
+  "fetch_profile": {
+    "_comment": "Reference price = US price in USD. Defaults for every tool: locale en-US, timezone America/New_York, Accept-Language en-US. VEED prices by IP country (no public URL/currency parameter found in its pricing page; we do not spoof geo headers or call its internal API), so the US GitHub runner + US profile sees the US page.",
+    "veed": {
+      "locale": "en-US",
+      "timezone": "America/New_York",
+      "accept_language": "en-US,en;q=0.9"
+    }
   }
 }

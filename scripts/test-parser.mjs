@@ -47,4 +47,10 @@ const r2 = evaluate(20, null, '', 'Core $20 $18 / month, billed annually'); if (
 // embedded
 const e = embeddedPrices('<script type="application/ld+json">{"@type":"Offer","price":"12.00","priceCurrency":"USD","priceSpecification":{"@type":"UnitPriceSpecification","price":12,"priceCurrency":"USD","unitText":"MONTH"}}</script><script>self.__next_f.push([1,"{\\"monthlyPrice\\":28,\\"name\\":\\"Standard\\"}"])</script>');
 if (!e.some(x => x.kind === 'jsonld' && x.v === 12 && x.period === 'month') || !e.some(x => x.kind === 'embedded' && x.v === 28 && x.period === 'month')) { fail++; console.log('FAIL embedded', e) } else console.log('ok   embedded', e.length);
+// fetch_profile / geo hints
+{ const { nonUsdMarks } = await import('./price-lib.mjs');
+  const a = nonUsdMarks('Creator E£ 499 / month'), b = nonUsdMarks('Creator $12 per user / month');
+  if (!(a.includes('EGP') && !a.includes('GBP') && b.length === 0)) { console.error('FAIL nonUsdMarks', a, b); process.exit(1) } else console.log('ok nonUsdMarks') }
+{ const c = JSON.parse((await import('node:fs')).readFileSync(new URL('./price-config.json', import.meta.url), 'utf8'));
+  if (c.fetch_profile?.veed?.locale !== 'en-US' || !/^en-US/.test(c.fetch_profile.veed.accept_language)) { console.error('FAIL veed profile'); process.exit(1) } else console.log('ok veed US profile') }
 console.log(fail ? `${fail} FAILED` : 'all parser tests passed'); process.exit(fail ? 1 : 0);
