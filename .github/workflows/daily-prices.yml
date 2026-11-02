@@ -24,8 +24,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with: { node-version: '22' }
-      - name: Parser tests
-        run: node scripts/test-parser.mjs
+      - name: Parser + rate-rule tests
+        run: node scripts/test-parser.mjs && node scripts/test-rates.mjs
+      - id: rates
+        name: Exchange rates → rates.json (Frankfurter + open.er-api.com, no keys)
+        continue-on-error: true   # a rates failure never blocks the price check; rates.json simply stays as it was
+        run: node scripts/update-rates.mjs --file rates.json --out out
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -54,10 +58,21 @@ jobs:
             out/report.json
             out/held.json
             out/plan.json
+            out/rates-report.md
+            out/rates-report.json
           retention-days: 90
       - name: Upload state
         uses: actions/upload-artifact@v4
         with: { name: price-state, path: out/state.json, retention-days: 90 }
+      - name: Commit rates.json (new file, no user-visible risk — written even in DRY-RUN)
+        if: steps.rates.outcome == 'success'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rates.json
+          if git diff --cached --quiet; then echo "rates.json unchanged"; exit 0; fi
+          git commit -m "rates: $(node -p "Object.keys(require('./rates.json').rates).length") currencies ($(date -u +%F))" -- rates.json
+          for i in 1 2 3; do git pull --rebase --autostash -q origin main && git push && exit 0; sleep 5; done; exit 1
       - name: Dry-run guard (data.json must be untouched)
         if: env.DRY_RUN != 'false'
         run: |
