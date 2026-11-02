@@ -60,6 +60,8 @@ jobs:
             out/plan.json
             out/rates-report.md
             out/rates-report.json
+            out/us-check.json
+            out/us-check.md
           retention-days: 90
       - name: Upload state
         uses: actions/upload-artifact@v4

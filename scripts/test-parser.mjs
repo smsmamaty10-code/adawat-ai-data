@@ -53,4 +53,9 @@ if (!e.some(x => x.kind === 'jsonld' && x.v === 12 && x.period === 'month') || !
   if (!(a.includes('EGP') && !a.includes('GBP') && b.length === 0)) { console.error('FAIL nonUsdMarks', a, b); process.exit(1) } else console.log('ok nonUsdMarks') }
 { const c = JSON.parse((await import('node:fs')).readFileSync(new URL('./price-config.json', import.meta.url), 'utf8'));
   if (c.fetch_profile?.veed?.locale !== 'en-US' || !/^en-US/.test(c.fetch_profile.veed.accept_language)) { console.error('FAIL veed profile'); process.exit(1) } else console.log('ok veed US profile') }
+{ const { normalizeList, matchValue } = await import('./us-check-lib.mjs');
+  const l = normalizeList({ _meta: {}, photoroom: { price_usd: 12.99, price_yearly_usd: 89.99, price_yearly_source: 'https://www.photoroom.com/pricing' }, x: { values: [7, { v: 3, unit: 'yearly' }], url: 'https://x.io/p' } });
+  const txt = 'Pro $12.99 / month or $89.99 billed yearly. Max $34.99 per month';
+  const ok = l.length === 2 && l[0].values.length === 2 && l[1].values[1].period === 'year' && matchValue(12.99, 'month', '', txt).match && matchValue(89.99, 'year', '', txt).match && !matchValue(34.99, 'year', '', txt).match && !matchValue(5, 'any', '', txt).match && !matchValue(9.99, 'any', '', 'only $19.99 here').match;
+  if (!ok) { console.error('FAIL us-check', JSON.stringify(l)); process.exit(1) } else console.log('ok us-check list/match') }
 console.log(fail ? `${fail} FAILED` : 'all parser tests passed'); process.exit(fail ? 1 : 0);

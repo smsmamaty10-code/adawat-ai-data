@@ -10,8 +10,9 @@
 //   • DRY_RUN (default true): data.json is never written; only out/ report files are produced.
 // Usage: node scripts/update-prices.mjs [--data data.json] [--config scripts/price-config.json] [--state prev-state/state.json] [--out out]
 import fs from 'fs'; import path from 'path';
-import { htmlToText, evaluate, isChallenge, same } from './price-lib.mjs';
+import { htmlToText, evaluate, isChallenge, same, nonUsdMarks } from './price-lib.mjs';
 import { accept } from './app-accept.mjs';
+import { normalizeList, matchValue } from './us-check-lib.mjs';
 
 const A = process.argv.slice(2); const arg = (k, d) => { const i = A.indexOf(k); return i >= 0 ? A[i + 1] : d };
 const FILE = arg('--data', 'data.json'), CFG = JSON.parse(fs.readFileSync(arg('--config', 'scripts/price-config.json'), 'utf8'));
@@ -115,6 +116,31 @@ async function checkTool(t) {
 // ---- run (small concurrency)
 const results = []; const q = [...data.tools];
 await Promise.all(Array.from({ length: 6 }, async () => { while (q.length) { const t = q.shift(); try { results.push(await checkTool(t)) } catch (e) { results.push({ id: t.id, status: 'unconfirmed', cause: 'error: ' + e.message }) } } }));
+// ---- US check list (REPORT-ONLY): compare every listed value against the US pages; never touches data.json
+const US_LIST = arg('--us-check', 'us-check-list.json'); let usCheck = { list: US_LIST, present: false, items: [] };
+if (fs.existsSync(US_LIST)) { try {
+  const items = normalizeList(JSON.parse(fs.readFileSync(US_LIST, 'utf8'))); usCheck.present = true;
+  const toolsById = new Map(old.tools.map(t => [t.id, t]));
+  const checkItem = async it => { const t = toolsById.get(it.id) || {}; const prof = profileOf(it.id);
+    const urls = it.urls.length ? it.urls : [CFG.price_url?.[it.id] || t.price_url || t.source].filter(u => typeof u === 'string' && /^https?:\/\//.test(u));
+    const pages = [], fetch = [];
+    for (const url of urls) { const f = await staticFetch(url, prof); fetch.push({ url, via: 'static', status: f.status, challenge: !!f.challenge });
+      if (f.ok && !f.challenge) pages.push({ url, via: 'static', html: f.html, text: htmlToText(f.html) }) }
+    const tryAll = () => it.values.map(v => { for (const pg of pages) { const m = matchValue(v.value, v.period, pg.html, pg.text); if (m.match) return { ...v, ...m, url: pg.url, via: pg.via } }
+      const near = pages.map(pg => ({ pg, m: matchValue(v.value, v.period, pg.html, pg.text) })).find(x => x.m.method);
+      return { ...v, match: false, method: near?.m.method || null, ctx: near?.m.ctx || '', url: near?.pg.url || null } });
+    let vals = tryAll();
+    if (RENDER && vals.some(v => !v.match)) for (const url of urls) { const g = await render(url, CFG.render_clicks?.[it.id] || [], prof); if (!g) break;
+      fetch.push({ url, via: 'rendered', status: g.status, challenge: !!g.challenge, error: g.error }); if (g.text && g.text.length > 200 && !g.challenge) pages.push({ url, via: 'rendered', html: g.html, text: g.text }) }
+    if (pages.some(p => p.via === 'rendered')) vals = tryAll();
+    const non_usd = [...new Set(pages.flatMap(p => nonUsdMarks(p.text)))];
+    const nMatch = vals.filter(v => v.match).length;
+    const status = !it.values.length ? 'no-values' : !pages.length ? (fetch.some(f => f.challenge || [401, 403, 429, 503].includes(f.status)) ? 'blocked' : 'unreadable') : nMatch === vals.length ? 'all-match' : nMatch ? 'partial' : 'mismatch';
+    const seen = pages.map(p => { const e = evaluate(0, null, p.html, p.text); return { url: p.url, via: p.via, monthly: e.monthly.slice(0, 10), yearly: e.yearly.slice(0, 6) } });
+    return { id: it.id, status, values: vals.map(v => ({ ...v, ctx: String(v.ctx || '').slice(0, 220) })), non_usd, seen, fetch, note: it.note } };
+  const qq = [...items]; await Promise.all(Array.from({ length: 4 }, async () => { while (qq.length) { const it = qq.shift(); try { usCheck.items.push(await checkItem(it)) } catch (e) { usCheck.items.push({ id: it.id, status: 'error', error: String(e.message || e).slice(0, 120) }) } } }));
+  usCheck.items.sort((a, b) => a.id.localeCompare(b.id));
+} catch (e) { usCheck.error = String(e.message || e).slice(0, 200) } }
 if (browserP) { const b = await browserP; if (b) await b.close().catch(() => { }) }
 const order = new Map(data.tools.map((t, i) => [t.id, i])); results.sort((a, b) => order.get(a.id) - order.get(b.id));
 const byId = new Map(data.tools.map(t => [t.id, t]));
@@ -187,6 +213,14 @@ const md = [`# Price check ${TODAY} ${DRY ? '(DRY-RUN — data.json untouched)' 
   '## Unconfirmed by cause', ...Object.entries(summary.unconfirmed_by_cause).map(([k, v]) => `- **${k}** (${v.length}): ${v.join(', ')}`), '',
   `Manual (converted currency): ${results.filter(r => r.status === 'manual').map(r => r.id).join(', ') || '-'}`, `Skipped: ${results.filter(r => r.status === 'skipped').map(r => `${r.id}(${r.cause})`).join(', ')}`, ''].join('\n');
 fs.writeFileSync(path.join(OUT, 'report.md'), md);
+{ const cnt = k => usCheck.items.filter(x => x.status === k).length; usCheck.summary = { date: TODAY, dry_run: DRY, report_only: true, present: usCheck.present, items: usCheck.items.length,
+    values: usCheck.items.reduce((n, x) => n + (x.values?.length || 0), 0), values_matched: usCheck.items.reduce((n, x) => n + (x.values || []).filter(v => v.match).length, 0),
+    all_match: cnt('all-match'), partial: cnt('partial'), mismatch: cnt('mismatch'), blocked: cnt('blocked'), unreadable: cnt('unreadable'), error: cnt('error') };
+  fs.writeFileSync(path.join(OUT, 'us-check.json'), JSON.stringify(usCheck, null, 1));
+  const S = usCheck.summary; const umd = [`## US check list (report-only, changes nothing) — \`${US_LIST}\``, '',
+    !usCheck.present ? '_list file not present in the repo — skipped_' : `Items ${S.items} · values ${S.values_matched}/${S.values} matched · all-match ${S.all_match} · partial ${S.partial} · mismatch ${S.mismatch} · blocked ${S.blocked} · unreadable ${S.unreadable}${usCheck.error ? ' · ERROR ' + usCheck.error : ''}`, '',
+    ...usCheck.items.map(x => `- **${x.id}** ${x.status}${x.non_usd?.length ? ' ⚠️ non-USD on page: ' + x.non_usd.join('/') : ''}: ` + (x.values || []).map(v => `${v.match ? '✅' : '❌'} $${v.value}/${v.period}${v.label ? ' (' + v.label + ')' : ''}${v.match ? ' [' + v.method + ' ' + v.via + ']' : v.method ? ' [' + v.method + ']' : ''}`).join(' · ') + (x.seen?.length ? ` — seen monthly ${JSON.stringify([...new Set(x.seen.flatMap(s => s.monthly))].slice(0, 8))} yearly ${JSON.stringify([...new Set(x.seen.flatMap(s => s.yearly))].slice(0, 5))}` : '')), ''].join('\n');
+  fs.writeFileSync(path.join(OUT, 'us-check.md'), umd); if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '\n' + umd) }
 if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
 console.log(md.split('\n').slice(0, 12).join('\n'));
 
