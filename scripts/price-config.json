@@ -1,0 +1,23 @@
+{
+  "_doc": "Overrides for scripts/update-prices.mjs. price_url: page to check instead of tool.price_url/source. extra_sources: additional OFFICIAL vendor URLs (count as independent sources). data_fixes: one-time data corrections applied only when publishing (DRY_RUN=false), and only if the current value equals 'from'. converted: tools whose stored USD is converted from a local currency (manual check only). render_clicks: exact visible labels Playwright clicks before reading the rendered page (tabs only, never sign-in or consent bypass).",
+  "price_url": {
+    "kling": "https://kling.ai/app/membership/membership-plan"
+  },
+  "extra_sources": {},
+  "data_fixes": {
+    "kling": {
+      "source": {
+        "from": "https://kling.ai/llms.txt",
+        "to": "https://kling.ai/app/membership/membership-plan"
+      }
+    }
+  },
+  "max_changes_per_run": 5,
+  "consecutive_days": 2,
+  "wayback_max_age_days": 14,
+  "render_clicks": {
+    "soundraw": [
+      "Content creators"
+    ]
+  }
+}

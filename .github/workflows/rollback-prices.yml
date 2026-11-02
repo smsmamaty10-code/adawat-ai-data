@@ -1,0 +1,44 @@
+name: Rollback prices
+# Restores price fields from a data-good-* tag WITH updated=today (the app rejects data whose max(updated) goes backwards).
+# Not gated by PRICE_BOT_ENABLED (it is the remedy). Pushes only when the dry_run input is "false".
+on:
+  workflow_dispatch:
+    inputs:
+      tag: { description: 'Rollback point, e.g. data-good-20261103-031530', required: true, type: string }
+      tools: { description: 'Comma-separated tool ids (empty = every tool whose price fields differ)', required: false, type: string, default: '' }
+      dry_run: { description: 'true = only show what would change', required: true, type: choice, options: ['true', 'false'], default: 'true' }
+permissions:
+  contents: write
+concurrency: { group: prices, cancel-in-progress: false }
+jobs:
+  rollback:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env: { TAG: '${{ inputs.tag }}', TOOLS: '${{ inputs.tools }}' }
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v5
+        with: { node-version: '22' }
+      - name: Restore from tag
+        run: |
+          [[ "$TAG" =~ ^data-good-[0-9]{8}-[0-9]{4,6}$ ]] || { echo "bad tag name"; exit 1; }
+          git show "refs/tags/$TAG:data.json" > "$RUNNER_TEMP/from.json"
+          cp data.json "$RUNNER_TEMP/old.json"
+          node scripts/rollback.mjs --from "$RUNNER_TEMP/from.json" --data data.json --tools "$TOOLS" --out out
+      - name: App acceptance gate
+        run: node scripts/app-accept.mjs --old "$RUNNER_TEMP/old.json" --new data.json --plan out/plan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rollback-${{ github.run_id }}
+          path: out/
+          retention-days: 90
+      - name: Push
+        if: inputs.dry_run == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          PRE="data-good-$(date -u +%Y%m%d-%H%M%S)"
+          git tag "$PRE" HEAD && git push origin "$PRE"
+          git add data.json
+          git diff --cached --quiet || { git commit -m "rollback prices to $TAG (updated=today; pre-rollback point: $PRE)" && git push; }

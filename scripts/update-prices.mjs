@@ -1,79 +1,198 @@
-// Weekly conservative price checker for data.json. No secrets, no AI, plain HTTP only (Node 20+ fetch).
-// Rules (see also change conditions below): monthly USD prices are read from the official pricing page (tool.source / price_url).
-//  - confirmed: old price_usd appears as a monthly USD price on the page → price_captured_on/updated = today
-//  - changed:   old price not found, exactly ONE distinct monthly USD candidate, within 0.5x..2x of old → update
-//  - anything else (ambiguous / not found / fetch failed / JS-only page) → unchanged, dates untouched
-import fs from 'fs';
-const FILE = process.argv[2] || 'data.json';
-const TODAY = new Date().toISOString().slice(0, 10);
-const old = JSON.parse(fs.readFileSync(FILE, 'utf8'));
-const data = structuredClone(old);
-const UA = 'Mozilla/5.0 (compatible; adawat-ai-price-check/1.0; +https://github.com/smsmamaty10-code/adawat-ai-data)';
+// Daily conservative price checker for data.json — no secrets, no AI, no personal keys (only public HTTP + optional free Playwright + Wayback).
+// SAFETY MODEL (see README):
+//   • confirm   : the stored monthly USD price is found on an official page → only price_captured_on (= «آخر تأكيد للسعر») moves. `updated` does NOT.
+//   • change ≤15%      : same unique value on 2 consecutive days → approved.
+//   • change 15–50%    : needs 2 independent official URLs agreeing AND 2 consecutive days, otherwise held.
+//   • change >50% or any drop >30% : always held (the app pushes a «price dropped» notification to every user).
+//   • more than N (5) proposed changes in one run → publish NOTHING (circuit breaker).
+//   • Wayback is used ONLY to confirm an unchanged price, never to change one. Annual÷12 confirmations are flagged as computed.
+//   • never deletes a value; held/failed tools keep their last good value and last-verified date.
+//   • DRY_RUN (default true): data.json is never written; only out/ report files are produced.
+// Usage: node scripts/update-prices.mjs [--data data.json] [--config scripts/price-config.json] [--state prev-state/state.json] [--out out]
+import fs from 'fs'; import path from 'path';
+import { htmlToText, evaluate, isChallenge, same } from './price-lib.mjs';
+import { accept } from './app-accept.mjs';
+
+const A = process.argv.slice(2); const arg = (k, d) => { const i = A.indexOf(k); return i >= 0 ? A[i + 1] : d };
+const FILE = arg('--data', 'data.json'), CFG = JSON.parse(fs.readFileSync(arg('--config', 'scripts/price-config.json'), 'utf8'));
+const OUT = arg('--out', 'out'); fs.mkdirSync(OUT, { recursive: true });
+const DRY = process.env.DRY_RUN !== 'false';                       // dry unless explicitly "false"
+const RENDER = process.env.RENDER !== '0', WAYBACK = process.env.WAYBACK !== '0';
+const TODAY = process.env.TODAY || new Date().toISOString().slice(0, 10);
+const YESTERDAY = new Date(Date.parse(TODAY) - 864e5).toISOString().slice(0, 10);
+const MAX_CHANGES = +(process.env.MAX_CHANGES || CFG.max_changes_per_run || 5), WB_AGE = CFG.wayback_max_age_days || 14;
+const old = JSON.parse(fs.readFileSync(FILE, 'utf8')); const data = structuredClone(old);
+let prevState = { pending: {}, held: {} }; try { const s = arg('--state'); if (s && fs.existsSync(s)) prevState = { pending: {}, held: {}, ...JSON.parse(fs.readFileSync(s, 'utf8')) } } catch { }
+const UA = 'Mozilla/5.0 (compatible; adawat-ai-price-check/2.0; +https://github.com/smsmamaty10-code/adawat-ai-data)';
 const num = v => typeof v === 'number' && isFinite(v) ? v : null;
+const log = (...x) => console.error(...x);
 
-async function get(url) {
-  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
-  try { const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.8' } });
-    if (!r.ok) return null; const s = await r.text(); return s.length > 500 ? s : null; } catch { return null } finally { clearTimeout(t) }
+async function staticFetch(url) {
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
+  try { const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': UA, 'accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8', 'accept-language': 'en-US,en;q=0.8' } });
+    const html = await r.text(); return { status: r.status, html, challenge: isChallenge(r.status, html), ok: r.ok && html.length > 500 } }
+  catch (e) { return { status: 0, html: '', error: String(e && e.name || e), ok: false } } finally { clearTimeout(tm) }
 }
-function text(html) {
-  return html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;|&#160;/g, ' ').replace(/&amp;/g, '&').replace(/&#36;|&dollar;/g, '$').replace(/\s+/g, ' ');
+// ---- optional Playwright (free, runs inside the CI runner). No stealth plugins, no CAPTCHA solving: if a page challenges us we give up.
+let browserP = null;
+async function browser() { if (!RENDER) return null; if (!browserP) browserP = (async () => { try { const pw = await import(process.env.PW_MODULE || 'playwright'); return await pw.chromium.launch({ headless: true }) } catch (e) { log('playwright unavailable:', e.message); return null } })(); return browserP }
+let renderSlots = 3; const waiters = [];
+async function render(url, clicks = []) {
+  const b = await browser(); if (!b) return null;
+  if (renderSlots <= 0) await new Promise(r => waiters.push(r)); renderSlots--;
+  const ctx = await b.newContext({ locale: 'en-US', viewport: { width: 1366, height: 900 } }); const page = await ctx.newPage();
+  try { const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => { });
+    await page.waitForTimeout(1500);
+    for (const label of clicks) { try { await page.getByText(label, { exact: true }).first().click({ timeout: 4000 }); await page.waitForTimeout(1200) } catch { } } // e.g. a plan-audience tab (config.render_clicks)
+    const html = await page.content(); const text = await page.evaluate(() => document.body ? document.body.innerText : '');
+    const status = resp ? resp.status() : 0; return { status, html, text: text.replace(/\s+/g, ' '), challenge: isChallenge(status, html) || /^Just a moment/i.test(await page.title()) }
+  } catch (e) { return { status: 0, html: '', text: '', error: e.message.slice(0, 80) } }
+  finally { await ctx.close().catch(() => { }); renderSlots++; const w = waiters.shift(); if (w) w() }
 }
-// "$20/month", "$20 per month", "$20 / mo", "$20 USD/month", "US$20 per user/month" (no yearly/annual billed totals)
-const RE = /(?:US)?\$\s?(\d{1,4}(?:\.\d{1,2})?)\s*(?:USD)?\s*(?:\/|per|a)\s*(?:user\s*\/?\s*|seat\s*\/?\s*|member\s*\/?\s*)?(?:mo\b|month)/gi;
-function monthly(t) { const out = new Map(); for (const m of t.matchAll(RE)) { const v = +m[1]; if (!(v > 0 && v < 5000)) continue;
-  const ctx = t.slice(Math.max(0, m.index - 100), m.index + m[0].length + 100); const annual = /annual|yearly|\/\s*year|per year|billed/i.test(ctx);
-  out.set(v, (out.get(v) || false) || annual) } return [...out].map(([v, annual]) => ({ v, annual })) }
-const same = (a, b) => Math.abs(a - b) < 0.006;
+// ---- Wayback (archive.org, no key): CONFIRM-ONLY second source, snapshot must be ≤ WB_AGE days old.
+let wbChain = Promise.resolve();                                   // serialise archive.org calls (it rate-limits with 429)
+const wbSlot = () => { const p = wbChain.then(() => new Promise(r => setTimeout(r, 1500))); wbChain = p; return p };
+async function wayback(url) {
+  try { await wbSlot();
+    const from = new Date(Date.parse(TODAY) - WB_AGE * 864e5).toISOString().slice(0, 10).replace(/-/g, '');
+    const cdx = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(url.replace(/^https?:\/\//, ''))}&output=json&filter=statuscode:200&from=${from}&limit=-1`;
+    let r; for (let k = 0; k < 2; k++) { const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 25000);
+      r = await fetch(cdx, { signal: ctl.signal, headers: { 'user-agent': UA } }).catch(() => null); clearTimeout(tm); if (r && r.status !== 429) break; await new Promise(z => setTimeout(z, 5000)) }
+    if (!r || !r.ok) return null; const rows = await r.json().catch(() => null); if (!Array.isArray(rows) || rows.length < 2) return null;
+    const [, ts, original] = rows[rows.length - 1]; const date = `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}`;
+    const age = (Date.parse(TODAY) - Date.parse(date)) / 864e5; if (age > WB_AGE || age < 0) return { date, tooOld: true };
+    await wbSlot(); const f = await staticFetch(`https://web.archive.org/web/${ts}id_/${original}`);
+    return f.ok ? { date, html: f.html, snapshot: `https://web.archive.org/web/${ts}/${original}` } : null
+  } catch { return null }
+}
+const host = u => { try { return new URL(u).hostname.replace(/^www\./, '').split('.').slice(-2).join('.') } catch { return '' } };
+const isConverted = t => !!(t.price_orig || t.price_orig_currency || /محوَّل|محول|بسعر صرف/.test(String(t.price_note || '')));
+const noteHas = (t, v) => new RegExp(`(^|[^\\d.])${String(v).replace('.', '\\.')}(?![\\d])`).test(String(t.price_note || ''));
 
-
-// ---- conservative offer detection: «N% off» / «discount N%» / «save N%» within 80 chars of a $ price,
-// plus promo wording (first month / new user / limited time / offer / sale / promo / coupon…), NOT annual-billing/API/lifetime wording (that's a standard discount). Auto offers are refreshed each run; kept ≤14 days if page unreadable.
-const OFF_RE = /(\d{1,2})\s?%\s?off\b|\b(?:discount|save)\s(?:of\s)?(\d{1,2})\s?%/gi;
-function offers(t) { const out = []; for (const m of t.matchAll(OFF_RE)) { const pc = +(m[1] || m[2]); if (pc < 5 || pc > 90) continue;
-  const ctx = t.slice(Math.max(0, m.index - 80), m.index + m[0].length + 80); if (!/\$\s?\d/.test(ctx) || /annual|yearly|\/\s*year|per year|billed|year|lifetime|batch|mtok|api\b|per credit|proofread/i.test(ctx)) continue;
-  if (!/first month|new user|limited[- ]time|offer|sale\b|promo|black friday|cyber monday|launch|ends|today only|coupon/i.test(ctx)) continue; // must look like a real promotion
-  out.push({ pc, quote: ctx.trim().slice(0, 200) }) } return out }
-const daysAgo = d => (Date.parse(TODAY) - Date.parse(d)) / 864e5;
-function setAutoOffers(t, found, url) { const keep = (t.offers || []).filter(o => !o.auto && !(o.ends_on && o.ends_on < TODAY)); // manual offers are never removed except when their end date has passed
-  const manualPromo = keep.some(o => o.type === 'limited' || o.type === 'new_user'); if (manualPromo) found = found === null ? null : []; const prevAuto = (t.offers || []).filter(o => o.auto);
-  let auto; if (found === null) auto = prevAuto.filter(o => daysAgo(o.captured_on) <= 14);
-  else { const pcs = [...new Set(found.map(f => f.pc))]; auto = pcs.length === 1 ? [{ auto: true, type: 'limited', text_ar: `خصم ${pcs[0]}%${/first month/i.test(found[0].quote) ? ' على الشهر الأول' : ''}${/new user/i.test(found[0].quote) ? ' للمستخدمين الجدد' : ''} مرصود في صفحة الأسعار الرسمية`, quote_en: found[0].quote, source: url, captured_on: TODAY, ends_on: null }] : [] }
-  const all = [...keep, ...auto]; if (all.length) t.offers = all; else delete t.offers; if (auto.length) stats.offers++ }
-const stats = { total: data.tools.length, confirmed: 0, changed: 0, unchanged: 0, unreadable: 0, skipped: 0, offers: 0 }; const ex = { confirmed: [], changed: [], unchanged: [], unreadable: [] };
-const tasks = data.tools.map(t => async () => {
-  const p = num(t.price_usd); const url = [t.price_url, t.source].find(u => typeof u === 'string' && /^https?:\/\//.test(u));
-  if (!p || p <= 0 || t.price_type !== 'ثابت' || !url) { stats.skipped++; return }
-  const html = await get(url); setAutoOffers(t, html ? offers(text(html)) : null, url); if (!html) { stats.unreadable++; ex.unreadable.push(t.id); return }
-  const cc = monthly(text(html)); const c = cc.map(x => x.v);
-  if (!c.length) { stats.unreadable++; ex.unreadable.push(t.id); return }
-  if (c.some(v => same(v, p))) { t.price_captured_on = TODAY; t.updated = TODAY; stats.confirmed++; ex.confirmed.push(`${t.id} $${p}`); return }
-  // change only: single candidate, no annual/billed wording nearby, USD-native price (not approx/converted), value not already in note (other plan/period)
-  const noteHas = v => new RegExp(`(^|[^\\d.])${String(v).replace('.', '\\.')}(?![\\d])`).test(String(t.price_note || ''));
-  if (c.length === 1 && !cc[0].annual && !t.price_approx && !t.price_orig && !noteHas(c[0]) && c[0] >= p * 0.5 && c[0] <= p * 2) {
-    const n = c[0]; t.price_prev_usd = p; t.price_usd = n;
-    if (typeof t.price_note === 'string') t.price_note = t.price_note.replace(new RegExp(`(^|[^\\d.])${String(p).replace('.', '\\.')}(?=\\s?\\$)`, 'g'), `$1${n}`).replace(new RegExp(`\\$\\s?${String(p).replace('.', '\\.')}(?![\\d.])`, 'g'), `$${n}`);
-    t.price_captured_on = TODAY; t.updated = TODAY; stats.changed++; ex.changed.push(`${t.id} $${p}→$${n}`); return
+async function checkTool(t) {
+  const p = num(t.price_usd); const primary = CFG.price_url?.[t.id] || [t.price_url, t.source].find(u => typeof u === 'string' && /^https?:\/\//.test(u));
+  const r = { id: t.id, name: t.name, price: p, url: primary || null };
+  if (!p || p <= 0 || t.price_type !== 'ثابت' || !primary) return { ...r, status: 'skipped', cause: t.price_type === 'مجاني بالكامل' || p === 0 ? 'free' : t.price_type === 'حسب الاستخدام' ? 'usage-based' : 'no-price' };
+  if (isConverted(t)) return { ...r, status: 'manual', cause: 'converted-currency' };
+  const urls = [...new Set([primary, ...(CFG.extra_sources?.[t.id] || []), ...(typeof t.price_yearly_source === 'string' && host(t.price_yearly_source) === host(primary) ? [t.price_yearly_source] : [])])];
+  const pages = []; const fetchInfo = [];
+  for (const url of urls) { const f = await staticFetch(url); fetchInfo.push({ url, via: 'static', status: f.status, challenge: !!f.challenge, error: f.error });
+    if (f.ok && !f.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), f.html, htmlToText(f.html)); pages.push({ url, via: 'static', ev }); if (ev.confirm) break } }
+  let conf = pages.find(x => x.ev.confirm);
+  if (!conf && RENDER) for (const url of urls) { const g = await render(url, CFG.render_clicks?.[t.id] || []); if (!g) break; fetchInfo.push({ url, via: 'rendered', status: g.status, challenge: !!g.challenge, error: g.error });
+    if (g.text && g.text.length > 200 && !g.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), g.html, g.text); pages.push({ url, via: 'rendered', ev }); if (ev.confirm) { conf = pages.at(-1); break } } }
+  if (conf) return { ...r, status: 'confirmed', method: conf.ev.confirm.method, computed: !!conf.ev.confirm.computed, via: conf.via, source: conf.url, quote: conf.ev.confirm.ctx.slice(0, 220) };
+  // ---- change proposal: every readable page must offer exactly ONE strict monthly value, the same one, not mentioned in the note as another plan
+  const perUrl = [...new Map(pages.map(x => [x.url, x])).values()];           // rendered result (pushed later) wins over static for the same URL
+  const singles = perUrl.map(x => x.ev.strict.length === 1 ? x.ev.strict[0] : null);
+  const vals = [...new Set(singles.filter(v => v != null))];
+  if (perUrl.length && !singles.includes(null) && vals.length === 1 && !noteHas(t, vals[0])) {
+    const n = vals[0]; const srcUrls = perUrl.map(x => x.url);
+    return { ...r, status: 'proposal', proposed: n, sources: srcUrls, pages: pages.map(x => ({ url: x.url, via: x.via, monthly: x.ev.monthly })) };
   }
-  stats.unchanged++; ex.unchanged.push(`${t.id} (old $${p}; page: ${c.slice(0, 6).join(',')})`);
-});
-// small concurrency
-const q = [...tasks]; await Promise.all(Array.from({ length: 6 }, async () => { while (q.length) await q.shift()() }));
+  // ---- Wayback: confirm-only
+  if (WAYBACK) { const w = await wayback(primary); if (w && w.html) { const ev = evaluate(p, num(t.price_yearly_usd), w.html, htmlToText(w.html));
+      if (ev.confirm) return { ...r, status: 'confirmed', method: 'wayback+' + ev.confirm.method, computed: !!ev.confirm.computed, via: 'wayback', source: w.snapshot, snapshot_date: w.date, quote: ev.confirm.ctx.slice(0, 220) } }
+    r.wayback = w ? (w.tooOld ? `snapshot too old (${w.date})` : `snapshot ${w.date}: price not found`) : 'no snapshot' }
+  // ---- classify failure
+  const anyBlocked = fetchInfo.some(f => f.challenge || [401, 403, 429, 503].includes(f.status)), anyRead = pages.length > 0;
+  const monthly = [...new Set(pages.flatMap(x => x.ev.monthly))], yearly = [...new Set(pages.flatMap(x => x.ev.yearly))];
+  let cause;
+  if (!anyRead) cause = anyBlocked ? 'blocked-403/challenge' : fetchInfo.some(f => f.status === 404) ? 'http-404' : 'fetch-failed';
+  else if (monthly.length) cause = 'ambiguous (stored price not on page; several/other values)';
+  else if (yearly.length) cause = 'annual-only (no matching annual÷12)';
+  else if (pages.every(x => x.ev.dollarCount === 0)) cause = RENDER ? 'no-$-price-even-rendered (JS/geo/blocked)' : 'js-rendered (no $ in static HTML)';
+  else cause = 'no-monthly-price-format';
+  return { ...r, status: 'unconfirmed', cause, monthly: monthly.slice(0, 8), yearly: yearly.slice(0, 5), fetch: fetchInfo };
+}
 
-// ---- safety checks (same spirit as publish-data.sh) ----
-const seen = new Set();
-const ok = data.tools.filter(t => { if (!t || typeof t !== 'object' || typeof t.id !== 'string' || !t.id || seen.has(t.id)) return false;
-  if (typeof t.name !== 'string' && typeof t.name_ar !== 'string') return false; const r = typeof t.rating === 'number' ? t.rating : null; if (r !== null && (r < 0 || r > 10)) return false; seen.add(t.id); return true });
-const fail = m => { console.error('ABORT: ' + m); process.exit(1) };
-if (ok.length !== data.tools.length) fail('tools fail validation');
-if (ok.length < Math.ceil(old.tools.length * 0.9)) fail('tool count guard');
-if (!data.videos || typeof data.videos !== 'object' || Array.isArray(data.videos)) fail('videos not an object');
-if (data.preview === true || data.tools.some(t => 'review_pending' in t)) fail('preview data present');
+// ---- run (small concurrency)
+const results = []; const q = [...data.tools];
+await Promise.all(Array.from({ length: 6 }, async () => { while (q.length) { const t = q.shift(); try { results.push(await checkTool(t)) } catch (e) { results.push({ id: t.id, status: 'unconfirmed', cause: 'error: ' + e.message }) } } }));
+if (browserP) { const b = await browserP; if (b) await b.close().catch(() => { }) }
+const order = new Map(data.tools.map((t, i) => [t.id, i])); results.sort((a, b) => order.get(a.id) - order.get(b.id));
+const byId = new Map(data.tools.map(t => [t.id, t]));
 
+// ---- apply the safety rules to proposals
+const state = { pending: {}, held: {}, last_run: TODAY };
+const approved = [], pending = [], held = [];
+for (const r of results.filter(x => x.status === 'proposal')) {
+  const t = byId.get(r.id), p = r.price, n = r.proposed; const pct = Math.abs(n - p) / p, drop = (p - n) / p;
+  const item = { id: r.id, name: r.name, old: p, new: n, change_pct: +(100 * (n - p) / p).toFixed(1), sources: r.sources };
+  const prev = prevState.pending?.[r.id] || prevState.held?.[r.id];
+  const firstSeen = prev && same(prev.new ?? prev.value, n) ? (prev.first_seen || prev.last_seen) : TODAY;
+  const consecutive = prev && same(prev.new ?? prev.value, n) && prev.last_seen === YESTERDAY;
+  if (t.price_approx) { held.push({ ...item, reason: 'price_approx=true (stored price is an estimate) — manual review' }); continue }
+  if (pct > 0.5 || drop > 0.3) { held.push({ ...item, reason: pct > 0.5 ? 'change > 50%' : 'drop > 30% (would notify every user)' }); continue }
+  if (pct > 0.15 && r.sources.length < 2) { held.push({ ...item, reason: 'change 15–50% needs 2 independent official sources' }); continue }
+  if (!consecutive) { pending.push({ ...item, reason: `day 1 of ${CFG.consecutive_days || 2}: needs the same unique value tomorrow`, first_seen: firstSeen }); continue }
+  approved.push({ ...item, first_seen: firstSeen });
+}
+const proposedCount = approved.length + pending.length + held.length;
+let breaker = false;
+if (proposedCount > MAX_CHANGES) { breaker = true; for (const a of approved.splice(0)) held.push({ ...a, reason: `circuit breaker: ${proposedCount} proposed changes > ${MAX_CHANGES} — nothing published` }) }
+for (const x of pending) state.pending[x.id] = { new: x.new, old: x.old, first_seen: x.first_seen, last_seen: TODAY };
+for (const x of held) state.held[x.id] = { new: x.new, old: x.old, reason: x.reason, first_seen: prevState.held?.[x.id] && same(prevState.held[x.id].new, x.new) ? prevState.held[x.id].first_seen : TODAY, last_seen: TODAY };
+for (const x of approved) state.pending[x.id] = undefined;
+
+// ---- build the candidate dataset (in memory). Held/pending values NEVER enter it.
+const confirmed = results.filter(r => r.status === 'confirmed');
+const fixesApplied = {};
+if (!breaker) {
+  for (const r of confirmed) { const t = byId.get(r.id); const d = r.via === 'wayback' ? r.snapshot_date : TODAY;
+    if (!t.price_captured_on || d > t.price_captured_on) t.price_captured_on = d;
+    t.price_check_method = r.method; if (r.computed) t.price_monthly_computed = true; else if ('price_monthly_computed' in t) t.price_monthly_computed = false }
+  for (const a of approved) { const t = byId.get(a.id); const p = a.old, n = a.new;
+    t.price_prev_usd = p; t.price_usd = n; t.price_changed_on = TODAY; t.price_captured_on = TODAY; t.updated = TODAY; t.price_check_method = 'text';
+    if (typeof t.price_note === 'string') t.price_note = t.price_note.replace(new RegExp(`(^|[^\\d.])${String(p).replace('.', '\\.')}(?=\\s?\\$)`, 'g'), `$1${n}`).replace(new RegExp(`\\$\\s?${String(p).replace('.', '\\.')}(?![\\d.])`, 'g'), `$${n}`) }
+  for (const [id, f] of Object.entries(CFG.data_fixes || {})) { const t = byId.get(id); if (!t) continue; for (const [k, v] of Object.entries(f)) if (t[k] === v.from && v.to) { t[k] = v.to; (fixesApplied[id] ||= []).push(k) } }
+}
 const changed = JSON.stringify(data.tools) !== JSON.stringify(old.tools);
-if (changed) { data.built = TODAY; fs.writeFileSync(FILE, JSON.stringify(data)) }
-const summary = `offers detected: ${stats.offers}; prices: ${stats.confirmed} confirmed, ${stats.changed} updated, ${stats.unchanged} unchanged (ambiguous), ${stats.unreadable} unreadable, ${stats.skipped} skipped (free/usage/no price) of ${stats.total}`;
-console.log(summary); for (const k of Object.keys(ex)) console.log(k + ':', ex[k].join(' | ') || '-');
-if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\nsummary=${summary}\n`);
-if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + '\n\n' + Object.entries(ex).map(([k, v]) => `**${k}**: ${v.join(', ') || '-'}`).join('\n\n') + '\n');
+if (changed) data.built = TODAY;
+const plan = { mode: 'publish', approved: approved.map(a => a.id), fixes: fixesApplied };
+const acceptErrors = accept(old, data, plan);
+
+// ---- report
+const checkable = results.filter(r => r.status !== 'skipped');
+const count = f => results.filter(f).length; const group = (arr, k) => arr.reduce((m, x) => ((m[x[k]] ||= []).push(x.id), m), {});
+const summary = {
+  date: TODAY, dry_run: DRY, render: RENDER, wayback: WAYBACK, total: results.length, checkable: checkable.length,
+  confirmed: confirmed.length, coverage_checkable_pct: +(100 * confirmed.length / checkable.length).toFixed(1), coverage_total_pct: +(100 * confirmed.length / results.length).toFixed(1),
+  confirmed_by_method: confirmed.reduce((m, r) => (m[r.method] = (m[r.method] || 0) + 1, m), {}),
+  confirmed_computed_annual: count(r => r.status === 'confirmed' && r.computed), confirmed_wayback: count(r => r.via === 'wayback'),
+  proposed_changes: proposedCount, approved: approved.length, pending: pending.length, held: held.length, circuit_breaker: breaker,
+  unconfirmed: count(r => r.status === 'unconfirmed'), manual_converted_currency: count(r => r.status === 'manual'), skipped: count(r => r.status === 'skipped'),
+  unconfirmed_by_cause: group(results.filter(r => r.status === 'unconfirmed'), 'cause'),
+  app_acceptance: acceptErrors.length ? { ok: false, errors: acceptErrors.slice(0, 30) } : { ok: true },
+  would_publish: !breaker && changed && !acceptErrors.length, data_fixes: fixesApplied,
+};
+fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify({ summary, approved, pending, held, results }, null, 1));
+fs.writeFileSync(path.join(OUT, 'state.json'), JSON.stringify(state, null, 1));
+fs.writeFileSync(path.join(OUT, 'held.json'), JSON.stringify(held, null, 1));
+fs.writeFileSync(path.join(OUT, 'plan.json'), JSON.stringify(plan, null, 1));
+const md = [`# Price check ${TODAY} ${DRY ? '(DRY-RUN — data.json untouched)' : ''}`, '',
+  `**Coverage:** ${confirmed.length}/${checkable.length} checkable (${summary.coverage_checkable_pct}%) · ${confirmed.length}/${results.length} total (${summary.coverage_total_pct}%)`, '',
+  `By method: ${Object.entries(summary.confirmed_by_method).map(([k, v]) => `${k}=${v}`).join(', ')} · annual÷12 (computed) = ${summary.confirmed_computed_annual} · wayback = ${summary.confirmed_wayback}`, '',
+  `Proposed changes: ${proposedCount} → approved ${approved.length}, pending (day 1) ${pending.length}, held ${held.length}${breaker ? ' — **CIRCUIT BREAKER: nothing published**' : ''}`, '',
+  `App acceptance (remoteOk + notification gate): ${acceptErrors.length ? '❌ ' + acceptErrors.slice(0, 5).join('; ') : '✅ OK'} · would publish: ${summary.would_publish}`, '',
+  '## Approved', ...(approved.length ? approved.map(a => `- ${a.id}: $${a.old} → $${a.new} (${a.change_pct}%) sources: ${a.sources.join(' , ')}`) : ['-']), '',
+  '## Pending (needs a 2nd consecutive day)', ...(pending.length ? pending.map(a => `- ${a.id}: $${a.old} → $${a.new} (${a.change_pct}%) — ${a.reason}`) : ['-']), '',
+  '## Held (kept last good value)', ...(held.length ? held.map(a => `- ${a.id}: $${a.old} → $${a.new} (${a.change_pct}%) — ${a.reason}`) : ['-']), '',
+  '## Unconfirmed by cause', ...Object.entries(summary.unconfirmed_by_cause).map(([k, v]) => `- **${k}** (${v.length}): ${v.join(', ')}`), '',
+  `Manual (converted currency): ${results.filter(r => r.status === 'manual').map(r => r.id).join(', ') || '-'}`, `Skipped: ${results.filter(r => r.status === 'skipped').map(r => `${r.id}(${r.cause})`).join(', ')}`, ''].join('\n');
+fs.writeFileSync(path.join(OUT, 'report.md'), md);
+if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+console.log(md.split('\n').slice(0, 12).join('\n'));
+
+// ---- publish (only when NOT dry-run and everything passed)
+const publish = !DRY && !breaker && changed && !acceptErrors.length;
+if (!DRY && acceptErrors.length) { console.error('ABORT: app acceptance failed:\n- ' + acceptErrors.join('\n- ')); }
+if (publish) {
+  fs.writeFileSync(FILE, JSON.stringify(data));
+  const logLines = [...approved.map(a => ({ date: TODAY, kind: 'change', ...a })), ...Object.entries(fixesApplied).map(([id, f]) => ({ date: TODAY, kind: 'data_fix', id, fields: f }))];
+  if (logLines.length) fs.appendFileSync(path.join(path.dirname(path.resolve(FILE)), 'changes.log.jsonl'), logLines.map(l => JSON.stringify(l)).join('\n') + '\n');
+}
+const commitMsg = `daily price check ${TODAY}: ${confirmed.length}/${checkable.length} confirmed, ${approved.length} changed, ${pending.length} pending, ${held.length} held`;
+if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `publish=${publish}\nheld=${held.length}\nsummary=${commitMsg}\n`);
+if (!DRY && acceptErrors.length) process.exit(1);

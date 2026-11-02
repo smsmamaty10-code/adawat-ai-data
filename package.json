@@ -1,0 +1,7 @@
+{
+  "name": "adawat-ai-data-scripts",
+  "private": true,
+  "description": "Price checker tooling for data.json (CI only). Playwright is free and runs inside the GitHub runner; no API keys.",
+  "devDependencies": { "playwright": "1.64.1" },
+  "scripts": { "test": "node scripts/test-parser.mjs", "check": "node scripts/update-prices.mjs --data data.json --out out" }
+}

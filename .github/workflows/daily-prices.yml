@@ -1,0 +1,80 @@
+name: Daily price check
+# Daily conservative price verification. Only GITHUB_TOKEN — no personal keys or accounts.
+# Repo variables:  DRY_RUN (anything but "false" ⇒ dry-run: data.json is never modified or pushed)
+#                  PRICE_BOT_ENABLED ("false" ⇒ kill switch: the job does not run at all)
+on:
+  schedule:
+    - cron: '15 3 * * *'   # daily 03:15 UTC (05:15 Cairo in winter, 06:15 in summer)
+  workflow_dispatch:
+permissions:
+  contents: write   # used only when DRY_RUN=false (tag + commit)
+  issues: write     # held changes → issues (only when DRY_RUN=false)
+  actions: read     # download the previous run's state artifact (2-consecutive-days rule)
+concurrency: { group: prices, cancel-in-progress: false }
+jobs:
+  check:
+    if: vars.PRICE_BOT_ENABLED != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      DRY_RUN: ${{ vars.DRY_RUN == 'false' && 'false' || 'true' }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: '22' }
+      - name: Parser tests
+        run: node scripts/test-parser.mjs
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-chromium-1.64.1-${{ runner.os }}
+      - name: Install Playwright (free, Chromium only)
+        continue-on-error: true   # if this fails the checker still runs without rendering
+        run: npm install --no-audit --no-fund --no-package-lock && npx playwright install --with-deps chromium
+      - name: Restore previous state (2-consecutive-days rule)
+        run: |
+          mkdir -p prev-state
+          for id in $(gh run list --workflow daily-prices.yml --status success --limit 10 --json databaseId -q '.[].databaseId'); do
+            gh run download "$id" -n price-state -D prev-state 2>/dev/null && { echo "state from run $id"; break; } || true
+          done
+          ls -la prev-state
+      - id: run
+        name: Check prices
+        run: node scripts/update-prices.mjs --data data.json --config scripts/price-config.json --state prev-state/state.json --out out
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-report-${{ github.run_id }}
+          path: |
+            out/report.md
+            out/report.json
+            out/held.json
+            out/plan.json
+          retention-days: 90
+      - name: Upload state
+        uses: actions/upload-artifact@v4
+        with: { name: price-state, path: out/state.json, retention-days: 90 }
+      - name: Dry-run guard (data.json must be untouched)
+        if: env.DRY_RUN != 'false'
+        run: |
+          git diff --exit-code -- data.json && echo "DRY-RUN - data.json unchanged, nothing pushed"
+      - name: Publish (acceptance gate → rollback tag → commit → push)
+        if: env.DRY_RUN == 'false' && steps.run.outputs.publish == 'true'
+        env: { SUMMARY: '${{ steps.run.outputs.summary }}' }
+        run: |
+          git show HEAD:data.json > "$RUNNER_TEMP/old.json"
+          node scripts/app-accept.mjs --old "$RUNNER_TEMP/old.json" --new data.json --plan out/plan.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          TAG="data-good-$(date -u +%Y%m%d-%H%M%S)"
+          git tag "$TAG" HEAD && git push origin "$TAG"
+          git add data.json
+          [ -f changes.log.jsonl ] && git add changes.log.jsonl
+          git diff --cached --quiet || { git commit -m "$SUMMARY (rollback point: $TAG)" && git push; }
+      - name: Open issues for held changes (bot team)
+        if: env.DRY_RUN == 'false' && steps.run.outputs.held != '0'
+        run: node scripts/open-issues.mjs out/held.json
