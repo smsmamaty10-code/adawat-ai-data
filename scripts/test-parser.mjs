@@ -58,4 +58,9 @@ if (!e.some(x => x.kind === 'jsonld' && x.v === 12 && x.period === 'month') || !
   const txt = 'Pro $12.99 / month or $89.99 billed yearly. Max $34.99 per month';
   const ok = l.length === 2 && l[0].values.length === 2 && l[1].values[1].period === 'year' && matchValue(12.99, 'month', '', txt).match && matchValue(89.99, 'year', '', txt).match && !matchValue(34.99, 'year', '', txt).match && !matchValue(5, 'any', '', txt).match && !matchValue(9.99, 'any', '', 'only $19.99 here').match;
   if (!ok) { console.error('FAIL us-check', JSON.stringify(l)); process.exit(1) } else console.log('ok us-check list/match') }
+{ const { normalizeList, matchValue } = await import('./us-check-lib.mjs');
+  const l = normalizeList({ _meta: {}, items: [{ tool: 'photoroom', field: 'price_usd', value: 12.99, currency: 'USD', url: 'https://www.photoroom.com/pricing' }, { tool: 'photoroom', field: 'price_yearly_usd', value: 89.99, currency: 'USD', url: 'https://www.photoroom.com/pricing' }, { tool: 'jasper', field: 'offers[annual].discount_pct', value: 14, currency: '%', url: 'https://www.jasper.ai/pricing' }] });
+  const pr = l.find(x => x.id === 'photoroom'), j = l.find(x => x.id === 'jasper');
+  const ok = l.length === 2 && pr.values.map(v => v.period).join() === 'month,year' && j.values[0].period === 'percent' && matchValue(14, 'percent', '', 'Save 14% with annual').match && !matchValue(4, 'percent', '', 'Save 14%').match;
+  if (!ok) { console.error('FAIL us-check rows', JSON.stringify(l)); process.exit(1) } else console.log('ok us-check flat rows') }
 console.log(fail ? `${fail} FAILED` : 'all parser tests passed'); process.exit(fail ? 1 : 0);

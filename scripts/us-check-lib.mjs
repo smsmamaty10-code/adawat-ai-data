@@ -8,13 +8,20 @@ import { candidates, embeddedPrices, normalizeMoney, same, nonUsdMarks } from '.
 export function normalizeList(raw) {
   let arr = Array.isArray(raw) ? raw : Array.isArray(raw?.items) ? raw.items : raw && typeof raw === 'object'
     ? Object.entries(raw).filter(([k]) => !k.startsWith('_')).map(([k, v]) => ({ id: k, ...(v && typeof v === 'object' ? v : {}) })) : [];
+  // flat rows {tool, field, value, currency, url} (review/us_check_list.json) → grouped by tool
+  if (arr.some(x => x && x.tool && 'value' in x && !x.id)) { const g = new Map();
+    for (const r of arr) { if (!r || !r.tool) continue; const it = g.get(r.tool) || { id: r.tool, urls: [], values: [] }; g.set(r.tool, it);
+      if (r.url && !it.urls.includes(r.url)) it.urls.push(r.url);
+      const f = String(r.field || ''); const period = r.currency === '%' || /pct|percent/i.test(f) ? 'percent' : f === 'price_usd' ? 'month' : f === 'price_yearly_usd' ? 'year' : 'any';
+      it.values.push({ value: +r.value, period, label: f, url: r.url || null }) }
+    arr = [...g.values()] }
   return arr.filter(x => x && x.id).map(x => {
-    let values = Array.isArray(x.values) ? x.values.map(v => typeof v === 'number' ? { value: v, period: 'any' } : { value: +(v.value ?? v.v ?? v.price), period: v.period || v.unit || 'any', label: v.label || v.plan || '' }) : [];
+    let values = Array.isArray(x.values) ? x.values.map(v => typeof v === 'number' ? { value: v, period: 'any' } : { value: +(v.value ?? v.v ?? v.price), period: v.period || v.unit || 'any', label: v.label || v.plan || '', ...(v.url ? { url: v.url } : {}) }) : [];
     if (!values.length) {
       if (typeof x.price_usd === 'number' && x.price_usd > 0) values.push({ value: x.price_usd, period: 'month', label: 'price_usd' });
       if (typeof x.price_yearly_usd === 'number' && x.price_yearly_usd > 0) values.push({ value: x.price_yearly_usd, period: 'year', label: 'price_yearly_usd' });
     }
-    values = values.filter(v => isFinite(v.value) && v.value > 0).map(v => ({ ...v, period: /^(mo|month|monthly)$/i.test(v.period) ? 'month' : /^(yr|year|yearly|annual)$/i.test(v.period) ? 'year' : 'any' }));
+    values = values.filter(v => isFinite(v.value) && v.value > 0).map(v => ({ ...v, period: /^(mo|month|monthly)$/i.test(v.period) ? 'month' : /^(yr|year|yearly|annual)$/i.test(v.period) ? 'year' : /^(percent|pct|%)$/i.test(v.period) ? 'percent' : 'any' }));
     const urls = [...new Set([...(Array.isArray(x.urls) ? x.urls : []), x.url, x.price_url, x.price_yearly_source, x.source].filter(u => typeof u === 'string' && /^https?:\/\//.test(u)))];
     return { id: String(x.id), urls, values, note: x.note || x.reason || '' };
   });
@@ -25,6 +32,8 @@ const lit = (t, v) => { const s = String(v).replace('.', '\\.'); const s2 = Numb
 
 // match one value on one page. period 'month' needs a monthly unit (text or embedded); 'year' a yearly one; 'any' just "$v".
 export function matchValue(value, period, html, text) {
+  if (period === 'percent') { const t = normalizeMoney(text); const m = new RegExp(`(?<![\\d.])${String(value).replace('.', '\\.')}\\s?%`).exec(t);
+    return m ? { match: true, method: 'text-percent', ctx: t.slice(Math.max(0, m.index - 100), m.index + 100).trim() } : { match: false, method: null, ctx: '' } }
   const cs = candidates(text), emb = html ? embeddedPrices(html) : [];
   const want = period === 'month' ? ['month', 'loose'] : period === 'year' ? ['year'] : null;
   const c = cs.find(c => same(c.v, value) && (!want || want.includes(c.period)));
