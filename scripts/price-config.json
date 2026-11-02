@@ -27,6 +27,33 @@
       "locale": "en-US",
       "timezone": "America/New_York",
       "accept_language": "en-US,en;q=0.9"
+    },
+    "cleanvoice": {
+      "currency_click": "USD",
+      "_why": "page has an EUR/USD toggle; static HTML defaults to EUR, rendered en-US shows USD; clicking USD pins it even outside the US"
+    },
+    "pitch": {
+      "force_render": true,
+      "_why": "Framer page: static HTML is EUR (€10), currency is set client-side after hydration; no currency URL param/cookie found (?currency=usd, /pricing/usd, /en-us/pricing fail)"
     }
+  },
+  "render_variants": {
+    "_comment": "click sequences rendered in order; the first must be the monthly-billing view (price_usd), later ones e.g. the yearly view (price_yearly_usd). currency_click from fetch_profile is prepended.",
+    "pitch": [
+      [
+        "Pay monthly"
+      ],
+      [
+        "Pay yearly"
+      ]
+    ],
+    "cleanvoice": [
+      [
+        "Monthly"
+      ],
+      [
+        "Yearly"
+      ]
+    ]
   }
 }

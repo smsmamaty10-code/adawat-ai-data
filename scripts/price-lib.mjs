@@ -28,7 +28,7 @@ export function normalizeMoney(t) {
 
 const NUM = String.raw`\$(\d{1,3}(?:,\d{3})+|\d{1,5})(?:\.(\d{1,2}))?(?![\d.,]*\d)`;
 const WHO = String.raw`(?:user|seat|member|person|editor|creator|agent|license)`;
-const MONTH_RE = new RegExp(String.raw`^(?:[^$]{0,45}?)(?:(?:\/|(?<![a-z])per\b|\ba\b)\s*(?:${WHO}\s*(?:\/|(?<![a-z])per\b)?\s*)?(?:mo|mon|mth|month|m)\b|\bbilled\s+monthly\b)|^\s*(?:USD\s*)?monthly\b(?!\s*(?:credit|\/|yearly|annual))`, 'i');
+const MONTH_RE = new RegExp(String.raw`^(?:[^$]{0,45}?)(?:(?:\/|(?<![a-z])per\b|\ba\b)\s*(?:${WHO}\s*(?:\/|(?<![a-z])per\b)?\s*)?(?:mo|mon|mth|month|m)\b|\bbilled\s+monthly\b)|^\s*(?:USD\s*)?monthly\b(?!\s*(?:credit|\/|yearly|annual))|^\s*month\b(?!\s*\(?\s*(?:paying|billed|paid)\s+(?:yearly|annually))`, 'i');   // bare "$12 month" (Pitch), but not "$10 month (paying yearly)"
 const YEAR_RE = new RegExp(String.raw`^(?:[^$]{0,45}?)(?:\/|(?<![a-z])per\b|\ba\b)\s*(?:${WHO}\s*(?:\/|(?<![a-z])per\b)?\s*)?(?:yr|year|annum)\b`, 'i');
 const OTHER_UNIT_RE = /^(?:[^$]{0,30}?)(?:\/|(?<![a-z])per\b)\s*(?:hour|hr|min|minute|second|sec|credit|token|1m|image|video|page|word|char|gb|day|week|call|request)\b|^\s*(?:one[- ]time|lifetime|once)/i;
 const ANNUAL_CTX = /annual|yearly|\/\s*yr\b|\/\s*year|per year|billed\s+(?:annually|yearly)|charged annually|paid annually/i;

@@ -31,9 +31,17 @@ const log = (...x) => console.error(...x);
 // Reference price = the US price in USD. Every request asks for the US/English page; per-tool overrides in config.fetch_profile.
 const DEFAULT_PROFILE = { locale: 'en-US', timezone: 'America/New_York', accept_language: 'en-US,en;q=0.9' };
 const profileOf = id => ({ ...DEFAULT_PROFILE, ...(CFG.fetch_profile?.[id] || {}) });
+// USD pinning (config.fetch_profile[id]): query = currency/locale URL params the site documents (e.g. {"currency":"USD"}),
+// cookies = public currency/locale preference cookies ({"name":"value"}; never session/auth cookies),
+// currency_click = visible currency toggle label clicked first in every render (e.g. "USD"),
+// force_render = static HTML is not the US/USD page (currency set client-side), so skip static and use the rendered page.
+const withQuery = (url, prof) => { if (!prof.query) return url; try { const u = new URL(url); for (const [k, v] of Object.entries(prof.query)) u.searchParams.set(k, String(v)); return u.toString() } catch { return url } };
+const cookieHeader = prof => prof.cookies ? Object.entries(prof.cookies).map(([k, v]) => `${k}=${v}`).join('; ') : null;
+// one or more click sequences per tool (config.render_variants, e.g. monthly-billing toggle first, then yearly); falls back to render_clicks
+const renderSets = (id, prof) => { const sets = CFG.render_variants?.[id] || [CFG.render_clicks?.[id] || []]; return sets.map(c => prof.currency_click ? [prof.currency_click, ...c.filter(x => x !== prof.currency_click)] : c) };
 async function staticFetch(url, prof = DEFAULT_PROFILE) {
-  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
-  try { const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': UA, 'accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8', 'accept-language': prof.accept_language } });
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000); const ck = cookieHeader(prof);
+  try { const r = await fetch(withQuery(url, prof), { signal: ctl.signal, redirect: 'follow', headers: { 'user-agent': UA, 'accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8', 'accept-language': prof.accept_language, ...(ck ? { cookie: ck } : {}) } });
     const html = await r.text(); return { status: r.status, html, challenge: isChallenge(r.status, html), ok: r.ok && html.length > 500 } }
   catch (e) { return { status: 0, html: '', error: String(e && e.name || e), ok: false } } finally { clearTimeout(tm) }
 }
@@ -44,8 +52,10 @@ let renderSlots = 3; const waiters = [];
 async function render(url, clicks = [], prof = DEFAULT_PROFILE) {
   const b = await browser(); if (!b) return null;
   if (renderSlots <= 0) await new Promise(r => waiters.push(r)); renderSlots--;
-  const ctx = await b.newContext({ locale: prof.locale, timezoneId: prof.timezone, extraHTTPHeaders: { 'accept-language': prof.accept_language }, viewport: { width: 1366, height: 900 } }); const page = await ctx.newPage();
-  try { const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const ctx = await b.newContext({ locale: prof.locale, timezoneId: prof.timezone, extraHTTPHeaders: { 'accept-language': prof.accept_language }, viewport: { width: 1366, height: 900 } });
+  if (prof.cookies) { try { const h = new URL(url).hostname.replace(/^www\./, ''); await ctx.addCookies(Object.entries(prof.cookies).map(([name, value]) => ({ name, value: String(value), domain: '.' + h, path: '/' }))) } catch { } }
+  const page = await ctx.newPage();
+  try { const resp = await page.goto(withQuery(url, prof), { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(1500);
     for (const label of clicks) { try { await page.getByText(label, { exact: true }).first().click({ timeout: 4000 }); await page.waitForTimeout(1200) } catch { } } // e.g. a plan-audience tab (config.render_clicks)
@@ -83,14 +93,14 @@ async function checkTool(t) {
   if (isConverted(t)) return { ...r, status: 'manual', cause: 'converted-currency' };
   const urls = [...new Set([primary, ...(CFG.extra_sources?.[t.id] || []), ...(typeof t.price_yearly_source === 'string' && host(t.price_yearly_source) === host(primary) ? [t.price_yearly_source] : [])])];
   const pages = []; const fetchInfo = []; const prof = profileOf(t.id);
-  for (const url of urls) { const f = await staticFetch(url, prof); fetchInfo.push({ url, via: 'static', status: f.status, challenge: !!f.challenge, error: f.error });
+  if (!(prof.force_render && RENDER)) for (const url of urls) { const f = await staticFetch(url, prof); fetchInfo.push({ url, via: 'static', status: f.status, challenge: !!f.challenge, error: f.error });
     if (f.ok && !f.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), f.html, htmlToText(f.html)); pages.push({ url, via: 'static', ev }); if (ev.confirm) break } }
   let conf = pages.find(x => x.ev.confirm);
-  if (!conf && RENDER) for (const url of urls) { const g = await render(url, CFG.render_clicks?.[t.id] || [], prof); if (!g) break; fetchInfo.push({ url, via: 'rendered', status: g.status, challenge: !!g.challenge, error: g.error });
-    if (g.text && g.text.length > 200 && !g.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), g.html, g.text); pages.push({ url, via: 'rendered', ev }); if (ev.confirm) { conf = pages.at(-1); break } } }
+  if (!conf && RENDER) outer: for (const url of urls) for (const [vi, clicks] of renderSets(t.id, prof).entries()) { const g = await render(url, clicks, prof); if (!g) break outer; fetchInfo.push({ url, via: 'rendered', variant: vi, clicks, status: g.status, challenge: !!g.challenge, error: g.error });
+    if (g.text && g.text.length > 200 && !g.challenge) { const ev = evaluate(p, num(t.price_yearly_usd), g.html, g.text); pages.push({ url, via: 'rendered', variant: vi, ev }); if (ev.confirm) { conf = pages.at(-1); break outer } } }
   if (conf) return { ...r, status: 'confirmed', method: conf.ev.confirm.method, computed: !!conf.ev.confirm.computed, via: conf.via, source: conf.url, quote: conf.ev.confirm.ctx.slice(0, 220) };
   // ---- change proposal: every readable page must offer exactly ONE strict monthly value, the same one, not mentioned in the note as another plan
-  const perUrl = [...new Map(pages.map(x => [x.url, x])).values()];           // rendered result (pushed later) wins over static for the same URL
+  const perUrl = [...new Map(pages.filter(x => !x.variant).map(x => [x.url, x])).values()];           // rendered result (pushed later) wins over static for the same URL; only variant 0 (monthly-billing view) is used for proposals
   const singles = perUrl.map(x => x.ev.strict.length === 1 ? x.ev.strict[0] : null);
   const vals = [...new Set(singles.filter(v => v != null))];
   if (perUrl.length && !singles.includes(null) && vals.length === 1 && !noteHas(t, vals[0])) {
@@ -124,20 +134,23 @@ if (fs.existsSync(US_LIST)) { try {
   const checkItem = async it => { const t = toolsById.get(it.id) || {}; const prof = profileOf(it.id);
     const urls = it.urls.length ? it.urls : [CFG.price_url?.[it.id] || t.price_url || t.source].filter(u => typeof u === 'string' && /^https?:\/\//.test(u));
     const pages = [], fetch = [];
-    for (const url of urls) { const f = await staticFetch(url, prof); fetch.push({ url, via: 'static', status: f.status, challenge: !!f.challenge });
+    if (!(prof.force_render && RENDER)) for (const url of urls) { const f = await staticFetch(url, prof); fetch.push({ url, via: 'static', status: f.status, challenge: !!f.challenge });
       if (f.ok && !f.challenge) pages.push({ url, via: 'static', html: f.html, text: htmlToText(f.html) }) }
     const tryAll = () => it.values.map(v => { for (const pg of pages) { const m = matchValue(v.value, v.period, pg.html, pg.text); if (m.match) return { ...v, ...m, url: pg.url, via: pg.via } }
       const near = pages.map(pg => ({ pg, m: matchValue(v.value, v.period, pg.html, pg.text) })).find(x => x.m.method);
       return { ...v, match: false, method: near?.m.method || null, ctx: near?.m.ctx || '', url: near?.pg.url || null } });
     let vals = tryAll();
-    if (RENDER && vals.some(v => !v.match)) for (const url of urls) { const g = await render(url, CFG.render_clicks?.[it.id] || [], prof); if (!g) break;
-      fetch.push({ url, via: 'rendered', status: g.status, challenge: !!g.challenge, error: g.error }); if (g.text && g.text.length > 200 && !g.challenge) pages.push({ url, via: 'rendered', html: g.html, text: g.text }) }
+    if (RENDER && vals.some(v => !v.match)) outer: for (const url of urls) for (const [vi, clicks] of renderSets(it.id, prof).entries()) { const g = await render(url, clicks, prof); if (!g) break outer;
+      fetch.push({ url, via: 'rendered', variant: vi, clicks, status: g.status, challenge: !!g.challenge, error: g.error }); if (g.text && g.text.length > 200 && !g.challenge) pages.push({ url, via: 'rendered', variant: vi, html: g.html, text: g.text }) }
     if (pages.some(p => p.via === 'rendered')) vals = tryAll();
-    const non_usd = [...new Set(pages.flatMap(p => nonUsdMarks(p.text)))];
+    // currency marks only from the page actually used for a URL: a rendered (en-US/USD) page supersedes the static HTML of the same URL
+    const usedPages = pages.filter(p => p.via === 'rendered' || !pages.some(q => q.via === 'rendered' && q.url === p.url));
+    const non_usd = [...new Set(usedPages.flatMap(p => nonUsdMarks(p.text)))];
+    const static_non_usd = [...new Set(pages.filter(p => p.via === 'static').flatMap(p => nonUsdMarks(p.text)))];
     const nMatch = vals.filter(v => v.match).length;
     const status = !it.values.length ? 'no-values' : !pages.length ? (fetch.some(f => f.challenge || [401, 403, 429, 503].includes(f.status)) ? 'blocked' : 'unreadable') : nMatch === vals.length ? 'all-match' : nMatch ? 'partial' : 'mismatch';
-    const seen = pages.map(p => { const e = evaluate(0, null, p.html, p.text); return { url: p.url, via: p.via, monthly: e.monthly.slice(0, 10), yearly: e.yearly.slice(0, 6) } });
-    return { id: it.id, status, values: vals.map(v => ({ ...v, ctx: String(v.ctx || '').slice(0, 220) })), non_usd, seen, fetch, note: it.note } };
+    const seen = pages.map(p => { const e = evaluate(0, null, p.html, p.text); return { url: p.url, via: p.via, variant: p.variant, non_usd: nonUsdMarks(p.text), monthly: e.monthly.slice(0, 10), yearly: e.yearly.slice(0, 6) } });
+    return { id: it.id, status, values: vals.map(v => ({ ...v, ctx: String(v.ctx || '').slice(0, 220) })), non_usd, static_non_usd, seen, fetch, note: it.note } };
   const qq = [...items]; await Promise.all(Array.from({ length: 4 }, async () => { while (qq.length) { const it = qq.shift(); try { usCheck.items.push(await checkItem(it)) } catch (e) { usCheck.items.push({ id: it.id, status: 'error', error: String(e.message || e).slice(0, 120) }) } } }));
   usCheck.items.sort((a, b) => a.id.localeCompare(b.id));
 } catch (e) { usCheck.error = String(e.message || e).slice(0, 200) } }

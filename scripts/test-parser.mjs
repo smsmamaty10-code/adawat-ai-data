@@ -63,4 +63,10 @@ if (!e.some(x => x.kind === 'jsonld' && x.v === 12 && x.period === 'month') || !
   const pr = l.find(x => x.id === 'photoroom'), j = l.find(x => x.id === 'jasper');
   const ok = l.length === 2 && pr.values.map(v => v.period).join() === 'month,year' && j.values[0].period === 'percent' && matchValue(14, 'percent', '', 'Save 14% with annual').match && !matchValue(4, 'percent', '', 'Save 14%').match;
   if (!ok) { console.error('FAIL us-check rows', JSON.stringify(l)); process.exit(1) } else console.log('ok us-check flat rows') }
+// bare "$12 month" is monthly; "$10 month (paying yearly)" is NOT a monthly-billing price (Pitch, rendered en-US)
+{ const { matchValue } = await import('./us-check-lib.mjs');
+  const m = 'PLUS 1 $12 month For individuals', y = 'PLUS 1 $10 month (paying yearly) For individuals';
+  const ok = matchValue(12, 'month', '', m).match && !matchValue(10, 'month', '', y).match;
+  console.log(ok ? 'ok bare month / paying yearly' : 'FAIL bare month / paying yearly'); if (!ok) fail++ }
+
 console.log(fail ? `${fail} FAILED` : 'all parser tests passed'); process.exit(fail ? 1 : 0);
